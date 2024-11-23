@@ -3,6 +3,7 @@
 use App\Http\Controllers\ActivationRecordController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\UserController;
+use App\Http\Middleware\IsUserEnabledMiddleware;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -10,7 +11,7 @@ use Illuminate\Support\Facades\Route;
 Route::post('/login', [AuthController::class, 'store']);
 
 
-Route::middleware('auth:sanctum')->group(function () {
+Route::middleware(['auth:sanctum', IsUserEnabledMiddleware::class])->group(function () {
     
     Route::get('/user', function (Request $request) {
         return $request->user();

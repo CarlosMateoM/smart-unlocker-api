@@ -76,7 +76,9 @@ class UserController extends Controller
      */
     public function destroy(User $user)
     {
-        $user->delete();
+        $user->is_enable = !$user->is_enable;   
+
+        $user->save();
 
         return response()->noContent();
     }

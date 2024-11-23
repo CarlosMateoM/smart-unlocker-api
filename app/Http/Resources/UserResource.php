@@ -20,6 +20,7 @@ class UserResource extends JsonResource
             'name'                  => $this->name,
             'email'                 => $this->email,
             'role'                  => $this->role,
+            'is_enable'             => $this->is_enable,
             'activation_records'    => ActivationRecordResource::collection($this->whenLoaded('activationRecords')),
         ];
     }
