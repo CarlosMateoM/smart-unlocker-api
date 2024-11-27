@@ -65,7 +65,7 @@ class ActivationRecordController extends Controller
             ], 404);
         }
 
-        if (! $request->user()->is_enable) {
+        if (! $user->is_enable) {
             return response()->json([
                 'status' => 'user_is_not_enabled',
                 'message' => 'User is not enabled'
