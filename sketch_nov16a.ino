@@ -3,256 +3,249 @@
 #include <ESP8266WiFi.h>
 #include <WebSocketsClient.h>
 #include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 
+// Debug Logging Macro
+#define DEBUG_PRINT(x) Serial.println(x)
+#define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+
+// Hardware Pinout Configuration
 #define SS_PIN 5
 #define RST_PIN 4
 #define RELAY_PIN 16
 
-MFRC522 rfid(SS_PIN, RST_PIN);
+// WiFi Credentials
+const char* WIFI_SSID = "MotoE32";
+const char* WIFI_PASSWORD = "mateowifi01";
 
-const char* ssid = "MotoE32";
-const char* password = "mateowifi01";
+// Server Configuration
+const char* API_HOST = "api.smartunlocker.site";
+const char* WS_PATH = "/app/jbwlrcnx3u1hz1qglfyj";
+const int WS_PORT = 443;
 
-const int server_port = 8000;
-const char* server_ip = "192.168.233.200";
+// Timing Constants
+const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
+const unsigned long UNLOCK_COOLDOWN = 7000;
+const unsigned long WS_RECONNECT_INTERVAL = 5000;
+const unsigned long CARD_DEBOUNCE_DELAY = 1000;
 
-const char* websocket_server = "192.168.233.200";
-const int websocket_port = 8080;
-// Modificamos la ruta del WebSocket para incluir el protocolo completo
-const char* websocket_path = "/app/n0yio342pjj34u5ua96t";
-
-WebSocketsClient webSocket;
-StaticJsonDocument<200> doc;
-StaticJsonDocument<200> innerDoc;
-
-// Variable para control de reconexión
-unsigned long lastReconnectAttempt = 0;
-const unsigned long reconnectInterval = 5000; // 5 segundos
-
-unsigned long lastUnlockTime = 0;
-const unsigned long UNLOCK_COOLDOWN = 8000;
-
-
-void unlockDoor() {
-    Serial.println("Abriendo cerradura...");
-    digitalWrite(RELAY_PIN, LOW);
-    delay(8000);
-    digitalWrite(RELAY_PIN, HIGH);
-    Serial.println("Cerradura cerrada");
-}
-
-String getUID() {
-    String uid = "";
-    for (byte i = 0; i < rfid.uid.size; i++) {
-        uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
-        uid += String(rfid.uid.uidByte[i], HEX);
-    }
-    uid.toUpperCase();
-    return uid;
-}
-
-bool sendRequest(String uid) {
-    if(WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi no conectado!");
-        return false;
-    }
-
-    HTTPClient http;
-    WiFiClient client;
+class SmartUnlocker {
+private:
+    MFRC522 rfid;
+    WebSocketsClient webSocket;
     
-    String url = "http://" + String(server_ip) + ":" + String(server_port) + "/api/activation-records";
-    Serial.println("Enviando petición a: " + url);
-    
-    http.begin(client, url);
-    http.addHeader("Accept", "application/json");
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer 12|z08SU3fi4shF7UeeRSVoOCZN9XVbhsJa6LE9C7iEfaffc656");
+    struct SystemState {
+        bool wifiConnected = false;
+        bool wsConnected = false;
+        unsigned long lastWiFiReconnect = 0;
+        unsigned long lastCardRead = 0;
+    } state;
 
-    StaticJsonDocument<200> requestBody;
-    requestBody["uid"] = uid;
-    String requestBodyString;
-    serializeJson(requestBody, requestBodyString);
+    StaticJsonDocument<512> jsonBuffer;  
 
-    int statusResponseCode = http.POST(requestBodyString);
-    Serial.println("Código de respuesta HTTP: " + String(statusResponseCode));
-
-    bool shouldUnlock = false;
-
-    if (statusResponseCode > 0) {
-        String response = http.getString();
-        Serial.println("Respuesta raw: " + response);
-
-        StaticJsonDocument<300> jsonResponse;
-        DeserializationError error = deserializeJson(jsonResponse, response);
-
-        if (error) {
-            Serial.println("Error parsing JSON");
-        } else {
-            shouldUnlock = jsonResponse["should_unlock"] | false;
-        }
-    } else {
-        Serial.println("Error en la petición HTTP: " + http.errorToString(statusResponseCode));
-    }
-
-    http.end();
-
-    return shouldUnlock;
-}
-
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-    switch(type) {
-        case WStype_DISCONNECTED:
-            Serial.println("[WSc] Desconectado!");
-            break;
-            
-        case WStype_CONNECTED: {
-          
-            Serial.println("[WSc] Conectado al servidor!");
-            // Enviar mensaje de suscripción con el formato correcto de Laravel Reverb
-            String subscribeMessage = "{\"event\":\"pusher:subscribe\",\"data\":{\"channel\":\"tag-rfid-read\"}}";
-            webSocket.sendTXT(subscribeMessage);
-            Serial.println("[WSc] Mensaje de suscripción enviado");
-            break;
-        }
-            
-        case WStype_TEXT: {
-            Serial.printf("[WSc] Mensaje recibido: %s\n", payload);
-            
-            DeserializationError error = deserializeJson(doc, payload);
-            if (!error) {
-                const char* event = doc["event"];
-                const char* channel = doc["channel"];
-                const char* dataStr = doc["data"]; // Obtenemos el string de data
-                
-                Serial.printf("[WSc] Evento recibido: %s\n", event);
-                
-                // Verificar si es el evento de desbloqueo
-                if (String(event) == "App\\Events\\UnlockEvent") {
-                    // Parsear el objeto data que viene como string
-                    DeserializationError innerError = deserializeJson(innerDoc, dataStr);
-                    
-                    if (!innerError) {
-                        bool shouldUnlock = innerDoc["unlock"];
-                        Serial.printf("Valor de unlock: %s\n", shouldUnlock ? "true" : "false");
-                        
-                        if (shouldUnlock) {
-                            unlockDoor();
-                        }
-                    } else {
-                        Serial.println("Error al parsear data del evento UnlockEvent");
-                    }
-                }
-                // Mantener el manejo de eventos de Pusher
-                else if (String(event) == "pusher:connection_established") {
-                    Serial.println("[WSc] Conexión establecida con Pusher");
-                }
-                else if (String(event) == "pusher:subscription_succeeded") {
-                    Serial.println("[WSc] Suscripción al canal exitosa");
-                }
-            } else {
-                Serial.println("Error al parsear mensaje WebSocket");
+    void setupWiFi() {
+        DEBUG_PRINT("[WIFI] Initializing WiFi Connection...");
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        
+        // Detailed WiFi connection logging
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED) {
+            delay(500);
+            DEBUG_PRINTF("[WIFI] Connecting... Attempt %d\n", ++attempts);
+            if (attempts > 20) {
+                DEBUG_PRINT("[WIFI] Connection Failed! Restarting...");
+                ESP.restart();
             }
-            break;
         }
-            
-        case WStype_ERROR:
-          
-            Serial.printf("[WSc] Error: %u\n", length);
-            break;
-            
-        case WStype_PING:
-            Serial.println("[WSc] Ping recibido");
-            break;
-            
-        case WStype_PONG:
-            Serial.println("[WSc] Pong recibido");
-            break;
+        
+        DEBUG_PRINTF("[WIFI] Connected! IP Address: %s\n", WiFi.localIP().toString().c_str());
     }
-}
 
-void setupWebSocket() {
-    Serial.println("[WSc] Iniciando conexión WebSocket...");
-    // Configurar WebSocket con más detalles de debugging
-    webSocket.begin(websocket_server, websocket_port, websocket_path);
-    webSocket.onEvent(webSocketEvent);
-    webSocket.setReconnectInterval(5000);
-    // Activar el heartbeat para mantener la conexión viva
-    webSocket.enableHeartbeat(15000, 3000, 2);
-}
+    void reconnectWebSocket() {
+        DEBUG_PRINT("[WEBSOCKET] Attempting to reconnect...");
+        
+        webSocket.disconnect();
+        webSocket.beginSSL(API_HOST, WS_PORT, WS_PATH);
+        webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL); // Reconectar cada 5s si falla
+        webSocket.enableHeartbeat(15000, 3000, 3);  
+        webSocket.onEvent([this](WStype_t type, uint8_t* payload, size_t length) {
+            logWebSocketEvent(type, payload, length);
+            handleWebSocketEvent(type, payload, length);
+        });
+    }
+
+    void logWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+        switch(type) {
+            case WStype_CONNECTED:
+                DEBUG_PRINTF("[WEBSOCKET] Connected to %s\n", API_HOST);
+                break;
+            case WStype_DISCONNECTED:
+                DEBUG_PRINT("[WEBSOCKET] Disconnected!");
+                break;
+            case WStype_TEXT:
+                DEBUG_PRINTF("[WEBSOCKET] Received Text: %s\n", (char*)payload);
+                break;
+            case WStype_ERROR:
+                DEBUG_PRINT("[WEBSOCKET] Error occurred!");
+                break;
+        }
+    }
+
+    void handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+        switch(type) {
+            case WStype_CONNECTED:
+                state.wsConnected = true;
+                subscribeToChannel();
+                break;
+            
+            case WStype_DISCONNECTED:
+                state.wsConnected = false;
+                DEBUG_PRINT("[WEBSOCKET] Connection lost. Will retry.");
+                break;
+            
+            case WStype_TEXT:
+                processWebSocketMessage(payload, length);
+                break;
+        }
+    }
+
+    void subscribeToChannel() {
+        const char* subscribeMsg = "{\"event\":\"pusher:subscribe\",\"data\":{\"channel\":\"tag-rfid-read\"}}";
+        DEBUG_PRINT("[WEBSOCKET] Subscribing to channel...");
+        webSocket.sendTXT(subscribeMsg);
+    }
+
+    void processWebSocketMessage(uint8_t* payload, size_t length) {
+        DeserializationError error = deserializeJson(jsonBuffer, payload);
+        if (error) {
+            DEBUG_PRINTF("[JSON] Parsing failed: %s\n", error.c_str());
+            return;
+        }
+
+        const char* event = jsonBuffer["event"];
+        DEBUG_PRINTF("[WEBSOCKET] Received Event: %s\n", event);
+
+        if (strcmp(event, "App\\Events\\UnlockEvent") == 0) {
+            unlockDoor();
+        } 
+
+
+    }
+
+    bool sendActivationRequest(const String& uid) {
+        DEBUG_PRINTF("[HTTP] Sending activation request for UID: %s\n", uid.c_str());
+        
+        WiFiClientSecure client;
+        HTTPClient http;
+        
+        reconnectWebSocket();
+
+        client.setInsecure();
+        http.begin(client, "https://" + String(API_HOST) + "/api/activation-records");
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Authorization", "Bearer ");
+
+        String payload = "{\"uid\":\"" + uid + "\"}";
+        int httpCode = http.POST(payload);
+        
+        
+
+        DEBUG_PRINTF("[HTTP] Response Code: %d\n", httpCode);
+        
+        bool shouldUnlock = false;
+        if (httpCode == 201) {
+            String response = http.getString();
+            DEBUG_PRINTF("[HTTP] Response: %s\n", response.c_str());
+            
+            DeserializationError error = deserializeJson(jsonBuffer, response);
+            if (!error) {
+                shouldUnlock = jsonBuffer["should_unlock"] | false;
+                DEBUG_PRINTF("[HTTP] Unlock Decision: %s\n", shouldUnlock ? "UNLOCK" : "DENY");
+            } else {
+                DEBUG_PRINTF("[JSON] Parsing error: %s\n", error.c_str());
+            }
+        }
+
+        http.end();
+        return shouldUnlock;
+    }
+
+    void unlockDoor() {
+        DEBUG_PRINT("[RELAY] Unlocking door...");
+        digitalWrite(RELAY_PIN, LOW);
+        delay(UNLOCK_COOLDOWN);
+        digitalWrite(RELAY_PIN, HIGH);
+        DEBUG_PRINT("[RELAY] Door locked.");
+        delay(50); 
+        rfid.PCD_Init();
+    }
+
+    String getCardUID() {
+        String uid = "";
+        for (byte i = 0; i < rfid.uid.size; i++) {
+            uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+            uid += String(rfid.uid.uidByte[i], HEX);
+        }
+        return uid;
+    }
+
+public:
+    SmartUnlocker() : rfid(SS_PIN, RST_PIN) {}
+
+    void begin() {
+        Serial.begin(115200);
+        while(!Serial) { ; }  // Wait for Serial to be ready
+        
+        DEBUG_PRINT("\n[SYSTEM] Smart Unlocker Initializing...");
+        
+        SPI.begin();
+        rfid.PCD_Init();
+        DEBUG_PRINT("[RFID] RFID Module Initialized");
+        
+        pinMode(RELAY_PIN, OUTPUT);
+        digitalWrite(RELAY_PIN, HIGH);
+        DEBUG_PRINT("[RELAY] Relay Configured");
+        
+        setupWiFi();
+        reconnectWebSocket();
+        
+        DEBUG_PRINT("[SYSTEM] Initialization Complete!");
+    }
+
+    void update() {
+        webSocket.loop();
+        
+        // RFID Card Reading Logic
+        if (rfid.PICC_IsNewCardPresent() && 
+            rfid.PICC_ReadCardSerial() && 
+            (millis() - state.lastCardRead > CARD_DEBOUNCE_DELAY)) {
+            
+            String uid = getCardUID();
+            DEBUG_PRINTF("[RFID] Card Read. UID: %s\n", uid.c_str());
+            
+            if (sendActivationRequest(uid)) {
+                unlockDoor();
+            }
+            
+            rfid.PICC_HaltA();
+            rfid.PCD_StopCrypto1();
+
+            
+            state.lastCardRead = millis();
+        }
+        
+    }
+};
+
+SmartUnlocker unlocker;
 
 void setup() {
-    Serial.begin(115200);
-    while (!Serial) { ; }  // Esperar a que el puerto serial esté listo
-    
-    Serial.println("\nIniciando setup...");
-    
-    SPI.begin();
-    rfid.PCD_Init();
-    Serial.println("RFID inicializado");
-
-    pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, HIGH);
-    Serial.println("Relay configurado");
-
-    // Conexión WiFi con más información de debugging
-    Serial.print("Conectando a WiFi");
-    WiFi.begin(ssid, password);
-    
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    
-    Serial.println("\nWiFi conectado!");
-    Serial.print("Dirección IP: ");
-    Serial.println(WiFi.localIP());
-    
-    setupWebSocket();
-    Serial.println("Setup completado!");
+    unlocker.begin();
 }
 
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi desconectado. Reconectando...");
-        WiFi.begin(ssid, password);
-        delay(6000);
-        return;
-    }
-
-    webSocket.loop();
-
-    // Verificar si necesitamos reiniciar la conexión WebSocket
-    if (!webSocket.isConnected()) {
-        unsigned long now = millis();
-        if (now - lastReconnectAttempt > reconnectInterval) {
-            Serial.println("Intentando reconectar WebSocket...");
-            setupWebSocket();
-            lastReconnectAttempt = now;
-        }
-    }
-
-    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-        
-        unsigned long currentTime = millis();
-        
-        // Check if enough time has passed since last unlock
-        if (currentTime - lastUnlockTime > UNLOCK_COOLDOWN) {
-            String uid = getUID();
-            Serial.println("UID leído: " + uid);
-            
-            bool shouldUnlock = sendRequest(uid);
-
-            if(shouldUnlock) {
-              lastUnlockTime = currentTime;
-            }
-            
-            
-        }
-
-        rfid.PICC_HaltA();
-        rfid.PCD_StopCrypto1();
-    }
-
-    rfid.PCD_Init();
-    delay(50);  // Reducido el delay para mejor respuesta
+    delay(50);
+    unlocker.update();
+    yield();
 }

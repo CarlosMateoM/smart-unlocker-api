@@ -61,14 +61,21 @@ class ActivationRecordController extends Controller
 
             return response()->json([
                 'should_unlock' => false,
-                'message' => 'The user is not registered',
+                'message'       => 'The user is not registered',
             ], 404);
         }
 
+        if (! $request->user()->is_enable) {
+            return response()->json([
+                'status' => 'user_is_not_enabled',
+                'message' => 'User is not enabled'
+            ], 403);
+        }
+
         $activationRecord = new ActivationRecord();
-        $activationRecord->user_id = $user->id;
-        $activationRecord->date = now()->toDateString();
-        $activationRecord->time = now()->toTimeString();
+        $activationRecord->user_id  = $user->id;
+        $activationRecord->date     = now()->toDateString();
+        $activationRecord->time     = now()->toTimeString();
         
         $activationRecord->save();
 
@@ -78,8 +85,7 @@ class ActivationRecordController extends Controller
 
         return response()->json([
             'should_unlock' => true,
-            'message' => 'The user is registered',
-            'data' => new ActivationRecordResource($activationRecord),
+            'message'       => 'The user is registered',
         ], 201);
     }
 
